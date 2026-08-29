@@ -19,6 +19,35 @@ from pydub import AudioSegment
 
 from gradio_utils.utils import get_available_items, refresh_dropdown_proxy, move_existing_folder, get_port_available, launch_tensorboard_proxy
 
+import torchaudio
+import soundfile as sf
+import torch
+
+# --- ROCm PATCH: Bypass torchcodec's hardcoded NVIDIA dependency ---
+def _patched_torchaudio_load(filepath, *args, **kwargs):
+    audio_np, sr = sf.read(filepath, dtype='float32')
+    tensor = torch.from_numpy(audio_np)
+    # torchaudio expects (channels, samples)
+    if tensor.dim() == 1:
+        tensor = tensor.unsqueeze(0)
+    else:
+        tensor = tensor.t()
+    return tensor, sr
+
+def _patched_torchaudio_save(filepath, src, sample_rate, *args, **kwargs):
+    # torchaudio expects (channels, samples), soundfile expects (samples, channels)
+    sf.write(filepath, src.cpu().t().numpy(), sample_rate)
+# --- PYTORCH 2.6 PATCH: Bypass strict weights_only check ---
+_original_torch_load = torch.load
+
+def _patched_torch_load(*args, **kwargs):
+    kwargs['weights_only'] = False
+    return _original_torch_load(*args, **kwargs)
+
+torch.load = _patched_torch_load
+torchaudio.load = _patched_torchaudio_load
+torchaudio.save = _patched_torchaudio_save
+
 def get_port_available(start_port=7860, end_port=7865):
     def is_port_in_use(port):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
