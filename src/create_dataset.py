@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import shutil
 from pydub import AudioSegment
+import stable_whisper  # Replaces whisperx
 
 whisper_model = None
 
@@ -25,32 +26,24 @@ def convert_to_mono(audio_file):
     mono_audio = audio.set_channels(1)
     mono_audio.export(audio_file, format="wav")
     
-def load_whisperx(model_name):
+def load_whisper_model(model_name):
     global whisper_model
-    whisper_model = whisperx.load_model(model_name, "cuda", compute_type="float16")
+    # PyTorch natively routes "cuda" to ROCm on your AMD setup
+    if whisper_model is None:
+        whisper_model = stable_whisper.load_model(model_name, device="cuda")
     
-# why whisperx?  Better than VAD, and no need to make a hugging face token for pyannote
-def run_whisperx(audio_file, language=None):
-    chunk_size = 10
-    
-    load_whisperx("large-v3")
+def run_transcription(audio_file, language=None):
+    load_whisper_model("large-v3")
     global whisper_model
-    audio = whisperx.load_audio(audio_file)
-    result = whisper_model.transcribe(audio=audio, chunk_size=chunk_size)
     
-    model_a, metadata = whisperx.load_align_model(language_code=result["language"], device="cuda")
-    result = whisperx.align(result["segments"], model_a, metadata, audio, device="cuda", return_char_alignments=False)
-    
-    # whisperx align for some reason doesn't include langauge tag which is needed for get_writer in return for result
-    if "language" not in result:
-        result["language"] = language
+    # Transcribe audio with word-level forced alignment
+    result = whisper_model.transcribe(audio_file, word_timestamps=True)
     
     audio_output_dir = os.path.dirname(audio_file)
-    srt_output_name = os.path.join(audio_output_dir, os.path.splitext(os.path.basename(audio_file))[0])
+    srt_output_name = os.path.join(audio_output_dir, os.path.splitext(os.path.basename(audio_file))[0] + ".srt")
     
-    # Write SRT file
-    srt_writer = get_writer("srt", srt_output_name)
-    srt_writer(result, srt_output_name, {"max_line_width": None, "max_line_count": None, "highlight_words": False})
+    # Export directly to SRT format using stable-ts built-in writer
+    result.to_srt_vtt(srt_output_name)
         
 def process_audio_files(folder_path, output_folder_name):
     base_folder_name = os.path.basename(folder_path)
@@ -69,17 +62,15 @@ def process_audio_files(folder_path, output_folder_name):
     with multiprocessing.Pool() as pool:
         pool.map(convert_to_mono,audio_list_to_process)
     
-    #run audio split with whisperx
+    #run audio split with stable-whisper
     for file in audio_list_to_process:
-        run_whisperx(file)
+        run_transcription(file)
     
     #split audio file based on timings outputted from whisper
     
     #trim each audio segment, grouping to 9 seconds or less
 
 if __name__ == "__main__":
-    import whisperx
-    from whisperx.utils import get_writer
     main_folder_path = select_folder()
     subfolders_list = parse_main_folder(main_folder_path)
     

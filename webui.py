@@ -51,37 +51,25 @@ def folder_to_process_proxy(folder_to_analyze):
     return gr.Dropdown(value=folder_to_analyze)
 
 def load_whisperx(model_name=None, progress=None):
-    import whisperx
-    # import whisper
-    if torch.cuda.is_available():
-        device = "cuda" 
-    else:
-        raise gr.Error("Non-Nvidia GPU detected, or CUDA not available")
+    import stable_whisper
+    print("Loading Stable Whisper model on GPU via ROCm...")
     try:
-        whisper_model = whisperx.load_model(model_name, device, download_root="whisper_models", compute_type="float16")
-    except Exception as e: # for older GPUs
-        print(f"Non float16 compatible GPU: {e}")
-        whisper_model = whisperx.load_model(model_name, device, download_root="whisper_models", compute_type="int8")
+        # device="cuda" maps natively to AMD GPUs in ROCm PyTorch
+        whisper_model = stable_whisper.load_model(model_name, device="cuda")
+    except Exception as e: 
+        print(f"Failed to load on GPU: {e}. Falling back to CPU...")
+        whisper_model = stable_whisper.load_model(model_name, device="cpu")
     print("Loaded Whisper model")
     return whisper_model
 
 def run_whisperx_transcribe(audio_file_path, chunk_size=15, language=None):
-    
-    audio = whisperx.load_audio(audio_file_path)
-    result = whisper_model.transcribe(audio=audio, batch_size=16, chunk_size=chunk_size)
-
-    model_a, metadata = whisperx.load_align_model(language_code=result["language"], device="cuda")
-    result = whisperx.align(result["segments"], model_a, metadata, audio, device="cuda", return_char_alignments=False)
-    
-    # whisperx align for some reason doesn't include langauge tag which is needed for get_writer in return for result
-    if "language" not in result:
-        result["language"] = language
-    
+    # stable-ts natively handles transcription and word-level alignment in one step
+    result = whisper_model.transcribe(audio_file_path, word_timestamps=True, language=language)
     return result
 
-def run_whisperx_srt(transcription_result, output_directory):
-    srt_writer = get_writer("srt", output_directory)
-    srt_writer(transcription_result, output_directory, {"max_line_width": None, "max_line_count": None, "highlight_words": False})
+def run_whisperx_srt(transcription_result, output_file_path):
+    # stable-ts has a built-in exporter for SRT files
+    transcription_result.to_srt_vtt(output_file_path)
 
 def process_speaker_folder(file_info, progress_bar=None):
     folder_path, audio_file, srt_file = file_info
@@ -133,7 +121,7 @@ def split_by_srt(folder_path, progress_bar=None):
     with Pool(cpu_count()) as pool:
         list(tqdm.tqdm(pool.imap_unordered(process_speaker_folder, file_pairs), total=len(file_pairs), desc="Processing Files", file=sys.stdout))
 
-def process_proxy(folder_to_process_path, progress = gr.Progress(track_tqdm=True)):
+def process_proxy(folder_to_process_path, progress = gr.Progress(track_tqdm=False)):
     global whisper_model
     training_root = "training"
     training_destination = os.path.join(training_root, os.path.basename(folder_to_process_path))
@@ -160,12 +148,12 @@ def process_proxy(folder_to_process_path, progress = gr.Progress(track_tqdm=True
             shutil.copy(file_path, copied_path)
             
             transcription_result = run_whisperx_transcribe(copied_path)
-            run_whisperx_srt(transcription_result, speaker_folder_dest)
             
+            # Calculate the exact SRT file path to save cleanly
             file_name = os.path.splitext(file)[0]
-            srt_orig_path = os.path.join(speaker_folder_dest, f"{os.path.basename(speaker_folder_path)}.srt")
             srt_new_path = os.path.join(speaker_folder_dest, f"{file_name}.srt")
-            os.rename(srt_orig_path, srt_new_path)
+            
+            run_whisperx_srt(transcription_result, srt_new_path)
             
     for folder in tqdm.tqdm(os.listdir(training_destination), desc="Splitting by SRT", file=sys.stdout):
         folder_path = os.path.join(training_destination, folder)
@@ -196,7 +184,6 @@ def find_largest_folder(directory):
                 max_file_count = file_count
                 largest_folder = root
     
-    # print(f"Largest folder: {largest_folder} with {max_file_count} files.")
     return max_file_count
     
 def training_calculations(total_audio_files, batch_size, epochs):
@@ -205,9 +192,6 @@ def training_calculations(total_audio_files, batch_size, epochs):
     return [batches_per_epoch, n_steps]
 
 def recommendation_proxy(data_dir, epochs):
-    # Based on one of my models, 2k audio files in a training folder, at about 50 epoches it sounds decent
-    # Exposed to this speaker a total of 140k times thoughout training
-    # 2k at 5 epochs also sounded fine, going to recommend the lowest
     recommended_exposure = 10000
     largest_file_count = find_largest_folder(data_dir)
     user_value = largest_file_count * epochs
@@ -231,15 +215,10 @@ def training_proxy(data_dir, batch_size, epochs, num_workers, resume, save_inter
     total_audio_files = count_items_in_directory(data_dir)
     
     training_values = training_calculations(total_audio_files, batch_size, epochs)
-    # calculate batches per epoch
     batches_per_epoch = training_values[0]
-    # calculate total steps needed
     n_steps = training_values[1]
-    # warmup steps
-    # just going with half based on the initial config set by the okada
     warmup_steps = n_steps // 2
     
-    # Max number of warmup_steps hardset at 10k
     if warmup_steps > 10000:
         warmup_steps = 10000
     
@@ -260,29 +239,24 @@ def training_proxy(data_dir, batch_size, epochs, num_workers, resume, save_inter
     output_dir.mkdir(parents=True, exist_ok=True)
     with updated_config_path.open('w') as file:
         json.dump(config, file, indent=4)
-
     
-    # data_dir, out_dir, resume=False, config=None
     try:
         run_training(data_dir, models_output_dir, batches_per_epoch, save_interval, log_interval , resume, updated_config_path)
     except Exception as e:
         raise gr.Error(e)
     
 if __name__ == "__main__":
-    # Keep the hefty imports away from multiprocessing 
-    import whisperx
-    from whisperx.utils import get_writer
     import torch
 
     whisper_model = None
     VALID_AUDIO_EXT = [
-        ".mp3",   # MPEG Layer 3 Audio
-        ".wav",   # Waveform Audio File Format
-        ".aac",   # Advanced Audio Coding
-        ".flac",  # Free Lossless Audio Codec
-        ".ogg",   # Ogg Vorbis
-        ".m4a",   # MPEG-4 Audio
-        ".opus",  # Opus Audio Codec
+        ".mp3",   
+        ".wav",   
+        ".aac",   
+        ".flac",  
+        ".ogg",   
+        ".m4a",   
+        ".opus",  
         ".mp4"
     ]
     
@@ -352,7 +326,6 @@ if __name__ == "__main__":
         else:
             gr.Info("Gradio will boot up with light mode on next start up.")
 
-    # Construct the JavaScript based on dark mode setting
     js_dark_mode = "document.querySelector('body').classList.add('dark');" if settings.get("dark_mode", True) else "document.querySelector('body').classList.remove('dark');"
 
     js = f"""
@@ -364,29 +337,28 @@ if __name__ == "__main__":
             container.style.textAlign = 'center';
             container.style.marginBottom = '20px';
             container.style.position = 'absolute';
-            container.style.left = '-100%'; // Start off-screen to the left
-            container.style.top = '20px'; // Adjust this value as needed to position the header vertically
-            container.style.transition = 'left 1s ease-out'; // Animate the position
-            container.style.zIndex = '1000'; // Ensure it stays on top of other elements
-            container.style.whiteSpace = 'nowrap'; // Prevent text wrapping
-            container.style.overflow = 'hidden'; // Ensure overflow is handled properly
-            container.style.textOverflow = 'ellipsis'; // Show ellipsis if text overflows
+            container.style.left = '-100%'; 
+            container.style.top = '20px'; 
+            container.style.transition = 'left 1s ease-out'; 
+            container.style.zIndex = '1000'; 
+            container.style.whiteSpace = 'nowrap'; 
+            container.style.overflow = 'hidden'; 
+            container.style.textOverflow = 'ellipsis'; 
 
             var text = 'Beatrice Voice Changer Training Webui';
             container.innerText = text;
 
             var gradioContainer = document.querySelector('.gradio-container');
-            gradioContainer.style.position = 'relative'; // Ensure the parent is positioned relatively
-            gradioContainer.style.paddingTop = '60px'; // Reserve space at the top to avoid overlap (adjust this value if needed)
+            gradioContainer.style.position = 'relative'; 
+            gradioContainer.style.paddingTop = '60px'; 
             gradioContainer.insertBefore(container, gradioContainer.firstChild);
 
-            // Trigger the animation to slide the text to the center
             setTimeout(function() {{
                 container.style.left = '50%';
-                container.style.transform = 'translateX(-50%)'; // Center the container
+                container.style.transform = 'translateX(-50%)'; 
             }}, 100);
 
-            {js_dark_mode} // Apply dark mode based on setting
+            {js_dark_mode} 
             return 'Animation created';
         }}
     """
@@ -435,7 +407,6 @@ if __name__ == "__main__":
                     TRAINING_SETTINGS["save_interval"] = gr.Slider(label="Save Interval in Epochs", minimum=1, maximum= 200, value= 5, step=1)
                     TRAINING_SETTINGS["log_interval"] = gr.Slider(label="Console Log Interval", minimum=10, maximum=1000, step=10)
                     TRAINING_SETTINGS["resume"] = gr.Checkbox(label="Resume Training", value=False)
-                    # TRAINING_SETTINGS["warmup_steps"] =
 
                     html_value = '''<h2>What are Batches</h2>
                                     <p>Bunches or groups of files that are processed at once by the model before updating gradients (model predictions --> loss calc --> gradient update). A batch size of 1 trains on a single audio file at a time, a batch size of 8 trains on 8 audio files at a time.</p>

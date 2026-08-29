@@ -6,3 +6,6 @@ whisper_models/
 *.pt
 test.py
 /*.wav
+env/
+info.txt
+temp/
