@@ -8,3 +8,10 @@ pyworld==0.3.2
 fastapi==0.112.1
 starlette==0.38.2
 
+stable-ts
+soundfile
+transformers==4.44.2 
+huggingface_hub==0.24.7
+pyannote.audio 
+nltk 
+omegaconf 

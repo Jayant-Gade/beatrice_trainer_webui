@@ -2,6 +2,14 @@ import os
 import sys
 import shutil
 
+from queue import Queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+from pydub import AudioSegment
+import pysrt
+import tqdm
+
 import gradio as gr
 import webbrowser
 import socket
@@ -48,6 +56,17 @@ torch.load = _patched_torch_load
 torchaudio.load = _patched_torchaudio_load
 torchaudio.save = _patched_torchaudio_save
 
+# --- LOCAL PATH CONFIGURATION ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 1. Force all PyTorch Hub downloads (Silero VAD, SpeechMOS) into local project folder
+CACHE_DIR = os.path.join(BASE_DIR, "cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
+torch.hub.set_dir(CACHE_DIR)
+
+# 2. Local temp scratchpad for intermediate audio chunks
+LOCAL_TEMP_DIR = os.path.join(BASE_DIR, "temp_processing")
+
 def get_port_available(start_port=7860, end_port=7865):
     def is_port_in_use(port):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -78,36 +97,126 @@ def folder_to_process_proxy(folder_to_analyze):
     if folder_check==False:
         raise gr.Error("Please check the folder structure and make sure it contains ONLY folders and that it's NOT empty")
     return gr.Dropdown(value=folder_to_analyze)
+gpu_model_queue = Queue()
 
-def load_whisperx(model_name=None, progress=None):
+
+gpu_model_queue = Queue()
+
+def load_whisperx(model_name='large-v3', parallel_mode=False):
     import stable_whisper
-    print("Loading Stable Whisper model on GPU via ROCm...")
+    num_instances = 2 if parallel_mode else 1
+    print(f"Loading {num_instances} Whisper model instance(s) into VRAM via ROCm...")
+    
+    while not gpu_model_queue.empty():
+        gpu_model_queue.get()
+        
+    for i in range(num_instances):
+        try:
+            model = stable_whisper.load_model(
+                model_name, 
+                device="cuda", 
+                download_root=os.path.join(CACHE_DIR, "whisper")
+            )
+            gpu_model_queue.put(model)
+            print(f"Loaded model instance {i+1}/{num_instances} into VRAM")
+        except Exception as e: 
+            print(f"Failed to load on GPU: {e}. Falling back to CPU...")
+            model = stable_whisper.load_model(
+                model_name, 
+                device="cpu", 
+                download_root=os.path.join(CACHE_DIR, "whisper")
+            )
+            gpu_model_queue.put(model)
+    return True
+
+def prepare_and_chunk_audio(src_file_path, dest_dir, max_chunk_sec=180):
+    """
+    Reads audio in-memory and writes temporary 3-minute working chunks
+    into the local temp directory.
+    """
+    audio = AudioSegment.from_file(src_file_path).set_channels(1)
+    duration_ms = len(audio)
+    max_chunk_ms = max_chunk_sec * 1000
+    base_name = os.path.splitext(os.path.basename(src_file_path))[0]
+    
+    tasks = []
+    
+    if duration_ms <= max_chunk_ms:
+        chunk_wav_path = os.path.join(dest_dir, f"{base_name}.wav")
+        chunk_srt_path = os.path.join(dest_dir, f"{base_name}.srt")
+        audio.export(chunk_wav_path, format="wav")
+        tasks.append((chunk_wav_path, chunk_srt_path))
+    else:
+        for idx, start_ms in enumerate(range(0, duration_ms, max_chunk_ms)):
+            end_ms = min(start_ms + max_chunk_ms, duration_ms)
+            chunk_audio = audio[start_ms:end_ms]
+            
+            chunk_name = f"{base_name}_part{idx:03d}"
+            chunk_wav_path = os.path.join(dest_dir, f"{chunk_name}.wav")
+            chunk_srt_path = os.path.join(dest_dir, f"{chunk_name}.srt")
+            
+            chunk_audio.export(chunk_wav_path, format="wav")
+            tasks.append((chunk_wav_path, chunk_srt_path))
+            
+    return tasks
+
+def transcribe_and_save(audio_path, srt_path):
+    model = gpu_model_queue.get()
     try:
-        # device="cuda" maps natively to AMD GPUs in ROCm PyTorch
-        whisper_model = stable_whisper.load_model(model_name, device="cuda")
-    except Exception as e: 
-        print(f"Failed to load on GPU: {e}. Falling back to CPU...")
-        whisper_model = stable_whisper.load_model(model_name, device="cpu")
-    print("Loaded Whisper model")
-    return whisper_model
+        result = model.transcribe(
+            audio_path, 
+            word_timestamps=True, 
+            verbose=None,
+            temperature=0.0,
+            vad=True
+        )
+        result.to_srt_vtt(srt_path)
+    finally:
+        gpu_model_queue.put(model)
 
-def run_whisperx_transcribe(audio_file_path, chunk_size=15, language=None):
-    # stable-ts natively handles transcription and word-level alignment in one step
-    result = whisper_model.transcribe(audio_file_path, word_timestamps=True, language=language)
-    return result
+def split_and_export_slices(audio_path, srt_path, final_dest_dir):
+    """
+    Slices the chunked audio according to the generated SRT and saves
+    the final <=8s training slices named after the speaker folder.
+    """
+    audio = AudioSegment.from_file(audio_path)
+    subs = pysrt.open(srt_path)
+    
+    # 1. Extract speaker name from the destination folder path
+    speaker_name = os.path.basename(os.path.normpath(final_dest_dir))
+    
+    # 2. Offset the counter by existing files to avoid overwriting across multiple audio chunks
+    existing_wavs = len([f for f in os.listdir(final_dest_dir) if f.lower().endswith(".wav")])
+    segment_counter = existing_wavs + 1
 
-def run_whisperx_srt(transcription_result, output_file_path):
-    # stable-ts has a built-in exporter for SRT files
-    transcription_result.to_srt_vtt(output_file_path)
+    for sub in subs:
+        start_time = (sub.start.hours * 3600 + sub.start.minutes * 60 + sub.start.seconds) * 1000 + sub.start.milliseconds
+        end_time = (sub.end.hours * 3600 + sub.end.minutes * 60 + sub.end.seconds) * 1000 + sub.end.milliseconds
+        duration = end_time - start_time
+        max_segment_duration = 8000  
+
+        while duration > max_segment_duration:
+            segment_end_time = start_time + max_segment_duration
+            segment = audio[start_time:segment_end_time]
+            output_file = os.path.join(final_dest_dir, f"{speaker_name}_seg{segment_counter:05d}.wav")
+            segment.export(output_file, format="wav")
+            start_time = segment_end_time
+            duration = end_time - start_time
+            segment_counter += 1
+
+        if duration > 0:
+            segment = audio[start_time:end_time]
+            output_file = os.path.join(final_dest_dir, f"{speaker_name}_seg{segment_counter:05d}.wav")
+            segment.export(output_file, format="wav")
+            segment_counter += 1
 
 def process_speaker_folder(file_info, progress_bar=None):
     folder_path, audio_file, srt_file = file_info
 
     audio = AudioSegment.from_file(audio_file)
-    audio = audio.set_channels(1) # Mono conversion
     subs = pysrt.open(srt_file)
 
-    base_name = os.path.basename(folder_path)
+    file_stem = os.path.splitext(os.path.basename(audio_file))[0]
     segment_counter = 1 
 
     for idx, sub in enumerate(tqdm.tqdm(subs, desc="Processing Subtitles", leave=False, file=sys.stdout)):
@@ -120,7 +229,7 @@ def process_speaker_folder(file_info, progress_bar=None):
         while duration > max_segment_duration:
             segment_end_time = start_time + max_segment_duration
             segment = audio[start_time:segment_end_time]
-            output_file = f"{folder_path}/{base_name}_{segment_counter}.wav"
+            output_file = f"{folder_path}/{file_stem}_seg{segment_counter}.wav"
             segment.export(output_file, format="wav")
             start_time = segment_end_time
             duration = end_time - start_time
@@ -128,7 +237,7 @@ def process_speaker_folder(file_info, progress_bar=None):
 
         if duration > 0:
             segment = audio[start_time:end_time]
-            output_file = f"{folder_path}/{base_name}_{segment_counter}.wav"
+            output_file = f"{folder_path}/{file_stem}_seg{segment_counter}.wav"
             segment.export(output_file, format="wav")
             segment_counter += 1
 
@@ -150,45 +259,67 @@ def split_by_srt(folder_path, progress_bar=None):
     with Pool(cpu_count()) as pool:
         list(tqdm.tqdm(pool.imap_unordered(process_speaker_folder, file_pairs), total=len(file_pairs), desc="Processing Files", file=sys.stdout))
 
-def process_proxy(folder_to_process_path, progress = gr.Progress(track_tqdm=False)):
-    global whisper_model
-    training_root = "training"
+def process_proxy(folder_to_process_path, parallel_toggle, progress=gr.Progress(track_tqdm=False)):
+    training_root = os.path.join(BASE_DIR, "training")
     training_destination = os.path.join(training_root, os.path.basename(folder_to_process_path))
     
-    try:
-        os.makedirs(training_destination, exist_ok=False)
-    except FileExistsError:
-        raise gr.Error("Remove existing training folder")
+    if os.path.exists(training_destination):
+        raise gr.Error("Training destination folder already exists. Please delete or rename it.")
+    os.makedirs(training_destination, exist_ok=True)
 
-    whisper_model = load_whisperx('large-v3')
+    # Initialize model instances inside local cache
+    load_whisperx('large-v3', parallel_mode=parallel_toggle)
     
     if not is_correct_dataset_structure(folder_to_process_path):
-        raise gr.Error("Invalid folder structure. Ensure the folder contains ONLY subfolders.")
+        raise gr.Error("Invalid folder structure. Ensure the folder contains ONLY speaker subfolders.")
 
-    speaker_folders_list = [os.path.join(folder_to_process_path, folder) for folder in os.listdir(folder_to_process_path)]
+    speaker_folders = [
+        os.path.join(folder_to_process_path, f) 
+        for f in os.listdir(folder_to_process_path) 
+        if os.path.isdir(os.path.join(folder_to_process_path, f))
+    ]
     
-    for speaker_folder_path in tqdm.tqdm(speaker_folders_list, desc="Processing Speakers", file=sys.stdout):
-        speaker_folder_dest = os.path.join(training_destination, os.path.basename(speaker_folder_path))
-        os.makedirs(speaker_folder_dest, exist_ok=False)
+    # Ensure clean local scratch space
+    if os.path.exists(LOCAL_TEMP_DIR):
+        shutil.rmtree(LOCAL_TEMP_DIR)
+    os.makedirs(LOCAL_TEMP_DIR, exist_ok=True)
 
-        for file in tqdm.tqdm(os.listdir(speaker_folder_path), desc="Processing Files", file=sys.stdout, leave=False):
-            file_path = os.path.join(speaker_folder_path, file)
-            copied_path = os.path.join(speaker_folder_dest, file)
-            shutil.copy(file_path, copied_path)
-            
-            transcription_result = run_whisperx_transcribe(copied_path)
-            
-            # Calculate the exact SRT file path to save cleanly
-            file_name = os.path.splitext(file)[0]
-            srt_new_path = os.path.join(speaker_folder_dest, f"{file_name}.srt")
-            
-            run_whisperx_srt(transcription_result, srt_new_path)
-            
-    for folder in tqdm.tqdm(os.listdir(training_destination), desc="Splitting by SRT", file=sys.stdout):
-        folder_path = os.path.join(training_destination, folder)
-        split_by_srt(folder_path, progress_bar=progress)
+    try:
+        for speaker_path in tqdm.tqdm(speaker_folders, desc="Processing Speakers", file=sys.stdout):
+            speaker_name = os.path.basename(speaker_path)
+            speaker_dest = os.path.join(training_destination, speaker_name)
+            os.makedirs(speaker_dest, exist_ok=True)
+
+            speaker_temp_dir = os.path.join(LOCAL_TEMP_DIR, speaker_name)
+            os.makedirs(speaker_temp_dir, exist_ok=True)
+
+            # 1. Pre-chunk into local temporary workspace
+            all_transcription_tasks = []
+            for file in tqdm.tqdm(os.listdir(speaker_path), desc="Pre-chunking Audio", file=sys.stdout, leave=False):
+                file_path = os.path.join(speaker_path, file)
+                tasks = prepare_and_chunk_audio(file_path, speaker_temp_dir, max_chunk_sec=180)
+                all_transcription_tasks.extend(tasks)
+
+            # 2. Transcribe using parallel/sequential dynamic worker pool
+            max_workers = 2 if parallel_toggle else 1
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(transcribe_and_save, audio_path, srt_path) 
+                    for audio_path, srt_path in all_transcription_tasks
+                ]
+                for future in tqdm.tqdm(as_completed(futures), total=len(futures), desc="Transcribing Tasks", file=sys.stdout, leave=False):
+                    future.result()
+
+            # 3. Slice each transcribed chunk directly into the final dataset folder
+            for audio_path, srt_path in tqdm.tqdm(all_transcription_tasks, desc="Generating Slices", file=sys.stdout, leave=False):
+                split_and_export_slices(audio_path, srt_path, speaker_dest)
+                
+    finally:
+        # 4. Clean up temporary uncompressed files immediately
+        if os.path.exists(LOCAL_TEMP_DIR):
+            shutil.rmtree(LOCAL_TEMP_DIR)
         
-    return "Dataset creation completed successfully!"
+    return "Dataset creation completed successfully! All temporary files purged."
 
 def count_items_in_directory(root):
         file_count = 0
@@ -399,6 +530,9 @@ if __name__ == "__main__":
                     hidden_dataset_textbox = gr.Textbox(value="datasets", visible=False)
                     list_of_datasets = get_available_items(root="datasets", directory_only=True)
                     folder_to_process = gr.Dropdown(choices=list_of_datasets, value=None, label="Dataset to Process")
+                    
+                    parallel_toggle = gr.Checkbox(label="Enable 2x GPU Parallelism (Double Model Load)", value=False)
+
                     refresh_datasets_button = gr.Button(value="Refresh Datasets Available")
                     move_existing_folder_button = gr.Button(value="Move Existing Folder")
                     process_button = gr.Button(value="Begin Process", variant="primary")
@@ -406,7 +540,7 @@ if __name__ == "__main__":
                     console_output = gr.Textbox(label="Progress Console")
 
                 process_button.click(fn=process_proxy,
-                                     inputs=folder_to_process,
+                                     inputs=[folder_to_process, parallel_toggle],
                                      outputs=console_output
                                      )
                 folder_to_process.change(fn=folder_to_process_proxy,
